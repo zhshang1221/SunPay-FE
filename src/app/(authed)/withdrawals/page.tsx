@@ -1,16 +1,12 @@
 "use client";
 
-import { Button, Card, Form, Input, InputNumber, Select, Space, Table, Tag, Typography, message } from "antd";
+import { Button, Card, Form, Input, Select, Space, Table, Tag, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createWithdrawal, fetchAccounts, fetchWithdrawals } from "@/lib/api";
-import { formatMinor } from "@/lib/money";
-import type { AccountItem, WithdrawalItem } from "@/lib/types";
+import { createWithdrawal, fetchAccounts, fetchWithdrawals, fetchWithdrawalWhitelist } from "@/lib/api";
+import { decimalToMinor, formatMinor } from "@/lib/money";
+import type { AccountItem, WithdrawalItem, WithdrawalWhitelistItem } from "@/lib/types";
 import { useMemo, useState } from "react";
-
-function isLikelyTronAddress(addr: string) {
-    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr);
-}
 
 function statusTag(s: string) {
     const v = s.toUpperCase();
@@ -20,16 +16,36 @@ function statusTag(s: string) {
     return <Tag>{s}</Tag>;
 }
 
+type WithdrawalFormValues = {
+    accountMapId?: string;
+    tronAddress?: string;
+    amount?: string | number;
+};
+
+type ApiError = {
+    response?: { data?: { message?: string } };
+    message?: string;
+};
+
 export default function WithdrawalsPage() {
-    const [form] = Form.useForm();
+    const [form] = Form.useForm<WithdrawalFormValues>();
     const [selectedAccountId, setSelectedAccountId] = useState<string | undefined>();
     const qc = useQueryClient();
     const [msgApi, ctxHolder] = message.useMessage();
 
     const accountsQ = useQuery({ queryKey: ["accounts"], queryFn: fetchAccounts, refetchInterval: 10_000 });
     const withdrawalsQ = useQuery({ queryKey: ["withdrawals", 50], queryFn: () => fetchWithdrawals(50), refetchInterval: 10_000 });
+    const whitelistQ = useQuery({ queryKey: ["withdrawal-whitelist"], queryFn: fetchWithdrawalWhitelist });
 
-    const accounts = accountsQ.data?.items ?? [];
+    const accounts = useMemo(() => accountsQ.data?.items ?? [], [accountsQ.data?.items]);
+    const whitelistOptions = useMemo(() => {
+        const items: WithdrawalWhitelistItem[] = whitelistQ.data?.items ?? [];
+        return items.map((item) => ({
+            value: item.address,
+            label: item.label ? `${item.label} (${item.address})` : item.address,
+        }));
+    }, [whitelistQ.data?.items]);
+    const hasWhitelist = whitelistOptions.length > 0;
 
     const m = useMutation({
         mutationFn: (payload: { accountMapId: string; tronAddress: string; amountMinor: string }) => createWithdrawal(payload),
@@ -43,8 +59,9 @@ export default function WithdrawalsPage() {
                 qc.invalidateQueries({ queryKey: ["balance-summary"] }),
             ]);
         },
-        onError: (e: any) => {
-            const m = e?.response?.data?.message ?? e?.message ?? "提交失败";
+        onError: (e: unknown) => {
+            const err = e as ApiError;
+            const m = err?.response?.data?.message ?? err?.message ?? "提交失败";
             msgApi.error(m);
         },
     });
@@ -66,10 +83,9 @@ export default function WithdrawalsPage() {
 
     const columns: ColumnsType<WithdrawalItem> = [
         { title: "状态", dataIndex: "status", key: "status", width: 120, render: (v) => statusTag(v) },
+        { title: "提现订单号", dataIndex: "id", key: "id", width: 260, render: (v, r) => <Typography.Text copyable>{v ?? r.id}</Typography.Text> },
         { title: "金额", key: "amount", width: 200, render: (_, r) => <Typography.Text strong>{formatMinor(r.amountMinor, r.currency)}</Typography.Text> },
         { title: "Tron 地址", dataIndex: "tronAddress", key: "tronAddress", width: 320, render: (v) => <Typography.Text copyable>{v}</Typography.Text> },
-        { title: "账户(Sunpay)", key: "account", width: 260, render: (_, r) => <Typography.Text copyable>{r.accountMap?.sunpayAccountId ?? r.accountMapId}</Typography.Text> },
-        { title: "飞书推送", dataIndex: "larkSent", key: "larkSent", width: 120, render: (v) => (v ? <Tag color="green">SENT</Tag> : <Tag>NO</Tag>) },
         { title: "创建时间", dataIndex: "createdAt", key: "createdAt", width: 200, render: (v) => (v ? new Date(v).toLocaleString() : "-") },
     ];
 
@@ -80,7 +96,7 @@ export default function WithdrawalsPage() {
                 <Card>
                     <Typography.Title level={4} style={{ marginTop: 0 }}>提现申请</Typography.Title>
                     <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                        选择账户、输入 Tron 地址与提现数量（minor）。系统会扣减余额并推送飞书机器人。
+                        选择账户、白名单地址，并输入最多两位小数的提现金额。系统会自动换算为 minor、扣减余额并推送飞书机器人。
                     </Typography.Paragraph>
                 </Card>
 
@@ -88,20 +104,37 @@ export default function WithdrawalsPage() {
                     <Form
                         form={form}
                         layout="vertical"
+                        initialValues={{ amount: "0" }}
                         onFinish={(v) => {
-                            const tron = String(v.tronAddress ?? "").trim();
-                            if (!isLikelyTronAddress(tron)) {
-                                msgApi.error("Tron 地址格式不正确（应以 T 开头，长度约 34）");
+                            const accountMapId = v.accountMapId;
+                            if (!accountMapId) {
+                                msgApi.error("请选择账户");
                                 return;
                             }
-                            m.mutate({ accountMapId: v.accountMapId, tronAddress: tron, amountMinor: String(v.amountMinor) });
+                            const tron = String(v.tronAddress ?? "").trim();
+                            if (!tron) {
+                                msgApi.error("请选择 Tron 地址");
+                                return;
+                            }
+                            const amountInput = typeof v.amount === "number" ? v.amount.toString() : (v.amount ?? "").trim();
+                            if (!amountInput) {
+                                msgApi.error("请输入提现金额");
+                                return;
+                            }
+                            let amountMinor: string;
+                            try {
+                                amountMinor = decimalToMinor(amountInput);
+                            } catch (err) {
+                                msgApi.error(err instanceof Error ? err.message : "金额格式不正确");
+                                return;
+                            }
+                            m.mutate({ accountMapId, tronAddress: tron, amountMinor });
                         }}
                         onValuesChange={(changed) => {
                             if (Object.prototype.hasOwnProperty.call(changed, "accountMapId")) {
                                 setSelectedAccountId(changed.accountMapId);
                             }
-                            // 触发实时校验
-                            form.validateFields(["amountMinor"]).catch(() => { });
+                            form.validateFields(["amount"]).catch(() => {});
                         }}
                     >
                         <Space size={16} align="start" wrap style={{ width: "100%" }}>
@@ -109,41 +142,68 @@ export default function WithdrawalsPage() {
                                 <Select placeholder="选择一个账户" loading={accountsQ.isLoading} options={accountOptions} showSearch optionFilterProp="label" />
                             </Form.Item>
 
-                            <Form.Item label="Tron 网络地址" name="tronAddress" rules={[{ required: true, message: "请输入 Tron 地址" }]} style={{ minWidth: 420 }}>
-                                <Input placeholder="T..." />
+                            <Form.Item
+                                label="Tron 网络地址"
+                                name="tronAddress"
+                                rules={[{ required: true, message: "请选择 Tron 地址" }]}
+                                style={{ minWidth: 420 }}
+                            >
+                                <Select
+                                    placeholder={hasWhitelist ? "请选择白名单地址" : "暂无可用白名单地址"}
+                                    loading={whitelistQ.isLoading}
+                                    options={whitelistOptions}
+                                    showSearch
+                                    optionFilterProp="label"
+                                    filterOption={(input, option) =>
+                                        (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
+                                    }
+                                    disabled={!hasWhitelist}
+                                />
                             </Form.Item>
 
                             <Form.Item
-                                label="提现数量（minor）"
-                                name="amountMinor"
+                                label="提现金额（最多两位小数）"
+                                name="amount"
                                 rules={[
-                                    { required: true, message: "请输入提现数量" },
+                                    { required: true, message: "请输入提现金额" },
                                     {
                                         validator: async (_, value) => {
-                                            if (value === undefined || value === null) return;
-                                            const amt = BigInt(String(value));
-                                            if (amt <= 0n) throw new Error("提现数量必须大于 0");
+                                            const raw = typeof value === "number" ? value.toString() : (value ?? "").trim();
+                                            if (!raw) return Promise.resolve();
+                                            let minor: string;
+                                            try {
+                                                minor = decimalToMinor(raw);
+                                            } catch (err) {
+                                                throw err instanceof Error ? err : new Error("金额格式不正确");
+                                            }
+                                            if (BigInt(minor) <= 0n) throw new Error("提现金额必须大于 0");
                                             if (selectedAccount) {
                                                 const bal = BigInt(selectedAccount.balanceMinor ?? "0");
-                                                if (amt > bal) throw new Error(`余额不足：可用 ${bal.toString()} minor`);
+                                                if (BigInt(minor) > bal) throw new Error("金额不能超过账户余额");
                                             }
                                         },
                                     },
                                 ]}
-                                style={{ minWidth: 240 }}
+                                style={{ minWidth: 320 }}
                             >
-                                <InputNumber min={1} precision={0} style={{ width: "100%" }} />
+                                <Input placeholder="请输入金额，最多两位小数" inputMode="decimal" disabled={!hasWhitelist} />
                             </Form.Item>
 
                             <Form.Item label=" ">
-                                <Button type="primary" htmlType="submit" loading={m.isPending}>
+                                <Button type="primary" htmlType="submit" loading={m.isPending} disabled={!hasWhitelist}>
                                     提交提现
                                 </Button>
                             </Form.Item>
                         </Space>
 
-                        {selectedAccount ? (
+                        {!hasWhitelist ? (
                             <Typography.Text type="secondary">
+                                暂无可用的提现地址，请联系管理员在白名单中配置。
+                            </Typography.Text>
+                        ) : null}
+
+                        {selectedAccount ? (
+                            <Typography.Text type="secondary" style={{ display: "block", marginTop: 8 }}>
                                 当前账户余额：{formatMinor(selectedAccount.balanceMinor, selectedAccount.balanceCurrency ?? selectedAccount.currency ?? "UNKNOWN")}（{selectedAccount.balanceMinor} minor）
                             </Typography.Text>
                         ) : null}

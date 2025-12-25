@@ -43,6 +43,36 @@ export type WithdrawalItem = {
 
 export type WithdrawalsResp = { items: WithdrawalItem[] };
 
+export type WithdrawalWhitelistItem = {
+    id: string;
+    agentId: string;
+    address: string;
+    label?: string | null;
+    createdAt?: string;
+};
+
+export type WithdrawalWhitelistResp = { items: WithdrawalWhitelistItem[] };
+
+export type CustomerItem = {
+    id: string;
+    outUserId: string;
+    sunpayCustomerId: string;
+    customerType?: string | null;
+    customerEmail: string;
+    status?: string | null;
+    sunpayStatus?: string | null;
+    countryCode?: string | null;
+    firstName?: string | null;
+    middleName?: string | null;
+    lastName?: string | null;
+    companyName?: string | null;
+    registrationNumber?: string | null;
+    createdAt?: string;
+    rawJson?: string | null;
+};
+
+export type CustomersResp = { items: CustomerItem[] };
+
 export type AccountItem = {
     id: string;
     sunpayAccountId: string;
@@ -52,6 +82,31 @@ export type AccountItem = {
 
     balanceMinor: string;
     balanceCurrency?: string | null;
+
+    countryCode?: string | null;
+    firstName?: string | null;
+    middleName?: string | null;
+    lastName?: string | null;
+    email?: string | null;
+    addressLine?: string | null;
+    city?: string | null;
+    postCode?: string | null;
+    nationality?: string | null;
+    birthDate?: string | null;
+    companyName?: string | null;
+    registrationNumber?: string | null;
+    tradingCountry?: string | null;
+    tradingCity?: string | null;
+    tradingAddress?: string | null;
+    iban?: string | null;
+    swiftBic?: string | null;
+    accountNumber?: string | null;
+    bankCountry?: string | null;
+    bankAddress?: string | null;
+    bankName?: string | null;
+    bankAccountHolderName?: string | null;
+    routingCodeEntries?: string | null;
+    depositInstructions?: string | null;
 
     // ✅ 若后端愿意返回（建议返回），前端可用它解析 iban/swift 等
     rawJson?: string | null;
