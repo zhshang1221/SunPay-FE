@@ -3,8 +3,9 @@
 import { Button, Card, Form, Input, Select, Space, Table, Tag, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createWithdrawal, fetchAccounts, fetchWithdrawals, fetchWithdrawalWhitelist } from "@/lib/api";
+import { createWithdrawal, fetchAccounts, fetchWithdrawals, fetchWithdrawalWhitelist, fetchLatestExchangeRate, fetchAgentEurUsdFee } from "@/lib/api";
 import { decimalToMinor, formatMinor } from "@/lib/money";
+import { formatExchangeRateMinor, formatFeePercentFromMinor, computeUsdPreviewFromMinor } from "@/lib/rate";
 import type { AccountItem, WithdrawalItem, WithdrawalWhitelistItem } from "@/lib/types";
 import { useMemo, useState } from "react";
 
@@ -30,12 +31,15 @@ type ApiError = {
 export default function WithdrawalsPage() {
     const [form] = Form.useForm<WithdrawalFormValues>();
     const [selectedAccountId, setSelectedAccountId] = useState<string | undefined>();
+    const [usdPreview, setUsdPreview] = useState<string>("");
     const qc = useQueryClient();
     const [msgApi, ctxHolder] = message.useMessage();
 
     const accountsQ = useQuery({ queryKey: ["accounts"], queryFn: fetchAccounts, refetchInterval: 10_000 });
     const withdrawalsQ = useQuery({ queryKey: ["withdrawals", 50], queryFn: () => fetchWithdrawals(50), refetchInterval: 10_000 });
     const whitelistQ = useQuery({ queryKey: ["withdrawal-whitelist"], queryFn: fetchWithdrawalWhitelist });
+    const rateQ = useQuery({ queryKey: ["eur-usd-rate"], queryFn: fetchLatestExchangeRate, refetchInterval: 60_000 });
+    const feeQ = useQuery({ queryKey: ["agent-eur-usd-fee"], queryFn: fetchAgentEurUsdFee, refetchInterval: 60_000 });
 
     const accounts = useMemo(() => accountsQ.data?.items ?? [], [accountsQ.data?.items]);
     const whitelistOptions = useMemo(() => {
@@ -46,9 +50,26 @@ export default function WithdrawalsPage() {
         }));
     }, [whitelistQ.data?.items]);
     const hasWhitelist = whitelistOptions.length > 0;
+    const exchangeRateMinor = rateQ.data?.rateMinor ?? null;
+    const agentFeeMinor = feeQ.data?.feeMinor ?? null;
+    const exchangeRateDisplay = formatExchangeRateMinor(exchangeRateMinor);
+    const agentFeeDisplay = formatFeePercentFromMinor(agentFeeMinor);
+    const hasMeta = typeof exchangeRateMinor === "number" && exchangeRateMinor > 0 && typeof agentFeeMinor === "number" && agentFeeMinor >= 0;
+    const canSubmit = hasWhitelist && hasMeta;
 
     const m = useMutation({
-        mutationFn: (payload: { accountMapId: string; tronAddress: string; amountMinor: string }) => createWithdrawal(payload),
+        mutationFn: (payload: { accountMapId: string; tronAddress: string; amountMinor: string }) => {
+            if (!hasMeta || exchangeRateMinor === null || agentFeeMinor === null) {
+                throw new Error("暂无汇率或手续费信息，暂时无法提现");
+            }
+            return createWithdrawal({
+                accountMapId: payload.accountMapId,
+                tronAddress: payload.tronAddress,
+                amountMinor: payload.amountMinor,
+                exchangeRateMinor,
+                agentFeeMinor,
+            });
+        },
         onSuccess: async () => {
             msgApi.success("提现申请已提交");
             form.resetFields();
@@ -71,7 +92,7 @@ export default function WithdrawalsPage() {
             const ccy = a.balanceCurrency ?? a.currency ?? "UNKNOWN";
             return {
                 value: a.id,
-                label: `${a.sunpayAccountId} | 余额 ${formatMinor(a.balanceMinor, ccy)}（${a.balanceMinor} minor）`,
+                label: `${a.sunpayAccountId} | 余额 ${formatMinor(a.balanceMinor, ccy)}`,
             };
         });
     }, [accounts]);
@@ -83,7 +104,14 @@ export default function WithdrawalsPage() {
 
     const columns: ColumnsType<WithdrawalItem> = [
         { title: "状态", dataIndex: "status", key: "status", width: 120, render: (v) => statusTag(v) },
-        { title: "提现订单号", dataIndex: "id", key: "id", width: 260, render: (v, r) => <Typography.Text copyable>{v ?? r.id}</Typography.Text> },
+        { title: "提现订单号", dataIndex: "id", key: "id", width: 220, render: (v, r) => <Typography.Text copyable>{v ?? r.id}</Typography.Text> },
+        {
+            title: "交易哈希",
+            dataIndex: "transactionHash",
+            key: "transactionHash",
+            width: 260,
+            render: (v) => (v ? <Typography.Text copyable>{v}</Typography.Text> : <Typography.Text type="secondary">-</Typography.Text>),
+        },
         { title: "金额", key: "amount", width: 200, render: (_, r) => <Typography.Text strong>{formatMinor(r.amountMinor, r.currency)}</Typography.Text> },
         { title: "Tron 地址", dataIndex: "tronAddress", key: "tronAddress", width: 320, render: (v) => <Typography.Text copyable>{v}</Typography.Text> },
         { title: "创建时间", dataIndex: "createdAt", key: "createdAt", width: 200, render: (v) => (v ? new Date(v).toLocaleString() : "-") },
@@ -96,8 +124,17 @@ export default function WithdrawalsPage() {
                 <Card>
                     <Typography.Title level={4} style={{ marginTop: 0 }}>提现申请</Typography.Title>
                     <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                        选择账户、白名单地址，并输入最多两位小数的提现金额。系统会自动换算为 minor、扣减余额并推送飞书机器人。
+                        选择账户、白名单地址，并输入最多两位小数的提现金额。
                     </Typography.Paragraph>
+                    {hasMeta ? (
+                        <Typography.Paragraph style={{ marginBottom: 0 }}>
+                            当前汇率：{exchangeRateDisplay ? `1 EUR = ${exchangeRateDisplay} USD` : "-"}，手续费率：{agentFeeDisplay ?? "-"}
+                        </Typography.Paragraph>
+                    ) : (
+                        <Typography.Paragraph type="secondary" style={{ marginBottom: 0, color: "#d46b08" }}>
+                            暂无汇率或手续费数据，暂时无法提交提现，请稍后重试。
+                        </Typography.Paragraph>
+                    )}
                 </Card>
 
                 <Card>
@@ -114,6 +151,10 @@ export default function WithdrawalsPage() {
                             const tron = String(v.tronAddress ?? "").trim();
                             if (!tron) {
                                 msgApi.error("请选择 Tron 地址");
+                                return;
+                            }
+                            if (!hasMeta) {
+                                msgApi.error("暂无汇率或手续费数据，请稍后重试");
                                 return;
                             }
                             const amountInput = typeof v.amount === "number" ? v.amount.toString() : (v.amount ?? "").trim();
@@ -133,6 +174,20 @@ export default function WithdrawalsPage() {
                         onValuesChange={(changed) => {
                             if (Object.prototype.hasOwnProperty.call(changed, "accountMapId")) {
                                 setSelectedAccountId(changed.accountMapId);
+                            }
+                            if (Object.prototype.hasOwnProperty.call(changed, "amount")) {
+                                const raw = typeof changed.amount === "number" ? changed.amount.toString() : (changed.amount ?? "").trim();
+                                if (raw && hasMeta) {
+                                    try {
+                                        const minorStr = decimalToMinor(raw);
+                                        const preview = computeUsdPreviewFromMinor(minorStr, exchangeRateMinor!, agentFeeMinor!);
+                                        setUsdPreview(preview);
+                                    } catch {
+                                        setUsdPreview("");
+                                    }
+                                } else {
+                                    setUsdPreview("");
+                                }
                             }
                             form.validateFields(["amount"]).catch(() => {});
                         }}
@@ -157,7 +212,7 @@ export default function WithdrawalsPage() {
                                     filterOption={(input, option) =>
                                         (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
                                     }
-                                    disabled={!hasWhitelist}
+                                    disabled={!canSubmit}
                                 />
                             </Form.Item>
 
@@ -186,11 +241,11 @@ export default function WithdrawalsPage() {
                                 ]}
                                 style={{ minWidth: 320 }}
                             >
-                                <Input placeholder="请输入金额，最多两位小数" inputMode="decimal" disabled={!hasWhitelist} />
+                                <Input placeholder="请输入金额，最多两位小数" inputMode="decimal" disabled={!canSubmit} />
                             </Form.Item>
 
                             <Form.Item label=" ">
-                                <Button type="primary" htmlType="submit" loading={m.isPending} disabled={!hasWhitelist}>
+                                <Button type="primary" htmlType="submit" loading={m.isPending} disabled={!canSubmit}>
                                     提交提现
                                 </Button>
                             </Form.Item>
@@ -205,6 +260,12 @@ export default function WithdrawalsPage() {
                         {selectedAccount ? (
                             <Typography.Text type="secondary" style={{ display: "block", marginTop: 8 }}>
                                 当前账户余额：{formatMinor(selectedAccount.balanceMinor, selectedAccount.balanceCurrency ?? selectedAccount.currency ?? "UNKNOWN")}（{selectedAccount.balanceMinor} minor）
+                            </Typography.Text>
+                        ) : null}
+
+                        {usdPreview ? (
+                            <Typography.Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+                                预计到账：{usdPreview} USD（按当前汇率与手续费计算，仅供参考）
                             </Typography.Text>
                         ) : null}
                     </Form>

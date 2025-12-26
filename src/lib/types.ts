@@ -30,6 +30,7 @@ export type WithdrawalItem = {
     currency: string;
     status: string;
     larkSent: boolean;
+    transactionHash?: string | null;
     createdAt?: string;
 
     accountMap?: {
@@ -41,7 +42,11 @@ export type WithdrawalItem = {
     };
 };
 
-export type WithdrawalsResp = { items: WithdrawalItem[] };
+export type WithdrawalsResp = {
+    items: WithdrawalItem[];
+    exchangeRateMinor?: number | null;
+    agentFeeMinor?: number | null;
+};
 
 export type WithdrawalWhitelistItem = {
     id: string;

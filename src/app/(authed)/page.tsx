@@ -227,7 +227,7 @@ export default function DashboardPage() {
                 net: (dep - wd).toString(),
             });
         }
-        return rows;
+        return rows.sort((a, b) => (a.day > b.day ? -1 : a.day < b.day ? 1 : 0));
     }, [txs, wds, now, primaryCurrency]);
 
     const dailyCols: ColumnsType<any> = [

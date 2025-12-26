@@ -74,12 +74,50 @@ export async function fetchWithdrawalWhitelist(): Promise<WithdrawalWhitelistRes
     return res.data;
 }
 
+export async function fetchLatestExchangeRate(): Promise<{ rateMinor: number | null; updatedAt?: string | null }> {
+    const res = await http.get("/api/rates/eur-usd/latest");
+    return res.data;
+}
+
+export async function fetchAgentEurUsdFee(): Promise<{ feeMinor: number | null; updatedAt?: string | null }> {
+    const res = await http.get("/api/agents/me/eur-usd-fee");
+    return res.data;
+}
+
+export type UploadDocumentResponse = {
+    document_id: string;
+    filename: string;
+    content_type: string;
+    size: number;
+};
+
+export async function uploadDocument(payload: {
+    fileName: string;
+    contentType?: string;
+    contentBase64: string;
+}): Promise<UploadDocumentResponse> {
+    const res = await http.post("/api/uploads", {
+        file_name: payload.fileName,
+        content_type: payload.contentType || "application/octet-stream",
+        content_base64: payload.contentBase64,
+    });
+    return res.data;
+}
+
 export async function createWithdrawal(payload: {
     accountMapId: string;
     tronAddress: string;
     amountMinor: string;
+    exchangeRateMinor: number | string;
+    agentFeeMinor: number | string;
 }): Promise<unknown> {
-    const res = await http.post("/api/withdrawals", payload);
+    const res = await http.post("/api/withdrawals", {
+        accountMapId: payload.accountMapId,
+        tronAddress: payload.tronAddress,
+        amountMinor: payload.amountMinor,
+        exchange_rate_minor: payload.exchangeRateMinor,
+        agent_fee_minor: payload.agentFeeMinor,
+    });
     return res.data;
 }
 

@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import {
     Button,
     Card,
@@ -19,11 +20,12 @@ import {
     Radio,
     Divider,
     Select,
+    Upload,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { RuleObject } from "antd/es/form";
 import dayjs from "dayjs";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     fetchAccounts,
@@ -34,9 +36,13 @@ import {
     createAccount,
     createWithdrawal,
     fetchWithdrawalWhitelist,
+    uploadDocument,
+    fetchLatestExchangeRate,
+    fetchAgentEurUsdFee,
 } from "@/lib/api";
 import type { CreateAccountPayload, CreateCustomerPayload } from "@/lib/api";
 import { decimalToMinor, formatMinor } from "@/lib/money";
+import { formatExchangeRateMinor, formatFeePercentFromMinor, computeUsdPreviewFromMinor } from "@/lib/rate";
 import type { AccountItem, CustomerItem, TransactionEventItem, WithdrawalItem, WithdrawalWhitelistItem } from "@/lib/types";
 
 type UserKind = "INDIVIDUAL" | "COMPANY";
@@ -65,6 +71,9 @@ type CustomerFormValues = {
     lastName?: string;
     idDocumentType?: string;
     idDocumentNumber?: string;
+    company_document_id?: string;
+    id_front_side_document_id?: string;
+    id_back_side_document_id?: string;
 };
 
 type AccountFormValues = {
@@ -101,8 +110,45 @@ const DOCUMENT_TYPE_OPTIONS = [
     { value: "DRIVINGLICENCE", label: "DRIVINGLICENCE" },
 ];
 
+type DocumentFieldKey = "company_document_id" | "id_front_side_document_id" | "id_back_side_document_id";
+type DocumentFieldConfig = {
+    key: DocumentFieldKey;
+    label: string;
+    description?: string;
+};
+
+const ID_DOCUMENT_FIELDS: DocumentFieldConfig[] = [
+    { key: "id_front_side_document_id", label: "身份证/证件正面" },
+    { key: "id_back_side_document_id", label: "身份证/证件反面" },
+];
+
+const COMPANY_DOCUMENT_FIELDS: DocumentFieldConfig[] = [
+    { key: "company_document_id", label: "公司注册文件" },
+    ...ID_DOCUMENT_FIELDS,
+];
+
+const ALLOWED_DOCUMENT_EXTENSIONS = ["png", "jpg", "jpeg", "pdf"];
+const MIN_UPLOAD_BYTES = 1024; // 1KB
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5MB
+
 const countryFilterOption = (input: string, option?: { label?: string; value?: string }) =>
     (option?.label ?? "").toLowerCase().includes(input.toLowerCase());
+
+function validateDocumentFile(file: File): string | null {
+    const type = (file.type || "").toLowerCase();
+    const name = file.name.toLowerCase();
+    const allowedTypes = ["image/jpeg", "image/png", "application/pdf"];
+    const hasAllowedType = allowedTypes.includes(type);
+    const hasAllowedExt = ALLOWED_DOCUMENT_EXTENSIONS.some((ext) => name.endsWith(`.${ext}`));
+    if (!hasAllowedType && !hasAllowedExt) {
+        return '仅支持 JPEG、PNG 或 PDF 格式文件';
+    }
+    const size = file.size ?? 0;
+    if (size < MIN_UPLOAD_BYTES || size > MAX_UPLOAD_BYTES) {
+        return "文件大小需在 1KB - 5MB 之间";
+    }
+    return null;
+}
 
 function normalizeStatus(s?: string | null) {
     return (s ?? "").trim().toUpperCase();
@@ -209,6 +255,15 @@ function renderStatus(s?: string | null) {
     return <Tag>{s}</Tag>;
 }
 
+function renderWithdrawalStatusTag(s?: string | null) {
+    if (!s) return <Tag>-</Tag>;
+    const v = s.toUpperCase();
+    if (v.includes("PENDING")) return <Tag color="blue">{s}</Tag>;
+    if (v.includes("SENT") || v.includes("APPROV")) return <Tag color="green">{s}</Tag>;
+    if (v.includes("FAIL") || v.includes("REJECT")) return <Tag color="red">{s}</Tag>;
+    return <Tag>{s}</Tag>;
+}
+
 function pickDisplayName(a: AccountItem): string {
     const cm = a.customerMap;
     if (!cm) return "-";
@@ -267,11 +322,18 @@ export default function AccountsPage() {
         queryKey: ["withdrawal-whitelist"],
         queryFn: fetchWithdrawalWhitelist,
     });
+    const rateQ = useQuery({ queryKey: ["eur-usd-rate"], queryFn: fetchLatestExchangeRate, refetchInterval: 60_000 });
+    const feeQ = useQuery({ queryKey: ["agent-eur-usd-fee"], queryFn: fetchAgentEurUsdFee, refetchInterval: 60_000 });
 
     const customers = useMemo(() => customersQ.data?.items ?? [], [customersQ.data?.items]);
     const accounts = useMemo(() => accountsQ.data?.items ?? [], [accountsQ.data?.items]);
     const txItems: TransactionEventItem[] = txQ.data?.items ?? [];
     const wdItems: WithdrawalItem[] = wdQ.data?.items ?? [];
+    const exchangeRateMinor = rateQ.data?.rateMinor ?? null;
+    const agentFeeMinor = feeQ.data?.feeMinor ?? null;
+    const exchangeRateDisplay = formatExchangeRateMinor(exchangeRateMinor);
+    const agentFeeDisplay = formatFeePercentFromMinor(agentFeeMinor);
+    const hasExchangeMeta = typeof exchangeRateMinor === "number" && exchangeRateMinor > 0 && typeof agentFeeMinor === "number" && agentFeeMinor >= 0;
     const withdrawalAddressOptions = useMemo(() => {
         const items: WithdrawalWhitelistItem[] = whitelistQ.data?.items ?? [];
         return items.map((item) => ({
@@ -280,6 +342,7 @@ export default function AccountsPage() {
         }));
     }, [whitelistQ.data?.items]);
     const hasWithdrawalAddresses = withdrawalAddressOptions.length > 0;
+    const disableWithdrawalActions = !hasWithdrawalAddresses || !hasExchangeMeta;
 
     const filteredCustomers = useMemo(
         () =>
@@ -340,6 +403,26 @@ export default function AccountsPage() {
     const [createdCustomer, setCreatedCustomer] = useState<{ customer?: CustomerItem | null } | null>(null);
 
     const [customerForm] = Form.useForm();
+    const [docInfos, setDocInfos] = useState<
+        Record<DocumentFieldKey, { id: string; filename: string; previewUrl?: string; mimeType?: string }>
+    >({});
+    const [docUploading, setDocUploading] = useState<Record<DocumentFieldKey, boolean>>({});
+
+    const resetDocumentStates = () => {
+        setDocInfos({});
+        setDocUploading({});
+    };
+
+    useEffect(
+        () => () => {
+            Object.values(docInfos).forEach((info) => {
+                if (info?.previewUrl) {
+                    URL.revokeObjectURL(info.previewUrl);
+                }
+            });
+        },
+        [docInfos],
+    );
 
     const openCustomerModal = (options?: { kind?: UserKind; prefill?: Partial<CustomerFormValues>; startStep?: number }) => {
         const nextKind = options?.kind ?? "COMPANY";
@@ -348,6 +431,7 @@ export default function AccountsPage() {
         setUserKind(nextKind);
         setCreatedCustomer(null);
         customerForm.resetFields();
+        resetDocumentStates();
         if (options?.startStep === 1) {
             applyDefaultsForKind(nextKind);
         } else {
@@ -371,8 +455,109 @@ export default function AccountsPage() {
         customerForm.setFieldsValue(nextValues);
     };
 
+    const handleDocumentUpload = async (field: DocumentFieldKey, file: File) => {
+        setDocUploading((prev) => ({ ...prev, [field]: true }));
+        try {
+            const contentBase64 = await fileToBase64(file);
+            const resp = await uploadDocument({
+                fileName: file.name,
+                contentType: file.type || "application/octet-stream",
+                contentBase64,
+            });
+            const previewUrl = URL.createObjectURL(file);
+            customerForm.setFieldsValue({ [field]: resp.document_id });
+            setDocInfos((prev) => {
+                const next = { ...prev };
+                if (prev[field]?.previewUrl) {
+                    URL.revokeObjectURL(prev[field].previewUrl as string);
+                }
+                next[field] = {
+                    id: resp.document_id,
+                    filename: resp.filename,
+                    previewUrl,
+                    mimeType: file.type || resp.content_type,
+                };
+                return next;
+            });
+            msgApi.success("文件上传成功");
+        } catch (err) {
+            msgApi.error(extractErrorMessage(err, "文件上传失败"));
+        } finally {
+            setDocUploading((prev) => ({ ...prev, [field]: false }));
+        }
+    };
+
+    const renderDocumentUploadField = (config: DocumentFieldConfig) => {
+        const info = docInfos[config.key];
+        const uploading = docUploading[config.key] ?? false;
+        return (
+            <Form.Item key={config.key} label={config.label} required style={{ width: "100%" }}>
+                <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                    <Upload
+                        showUploadList={false}
+                        accept=".jpg,.jpeg,.png,.pdf"
+                        beforeUpload={(file) => {
+                            const validationMessage = validateDocumentFile(file);
+                            if (validationMessage) {
+                                msgApi.error(validationMessage);
+                                return Upload.LIST_IGNORE;
+                            }
+                            handleDocumentUpload(config.key, file);
+                            return Upload.LIST_IGNORE;
+                        }}
+                    >
+                        <Button loading={uploading}>上传文件</Button>
+                    </Upload>
+                    {config.description ? <Typography.Text type="secondary">{config.description}</Typography.Text> : null}
+                    {info?.id ? (
+                        <Space direction="vertical" size={4}>
+                            <Typography.Text type="secondary">
+                                已上传：{info.filename}（ID: {info.id}）
+                            </Typography.Text>
+                            {info.previewUrl ? (
+                                <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                                    <Button size="small" onClick={() => window.open(info.previewUrl, "_blank")}>
+                                        预览
+                                    </Button>
+                                    {info.mimeType?.toLowerCase().includes("pdf") ? (
+                                        <Typography.Text type="secondary">PDF 文件已上传，可点击预览按钮查看</Typography.Text>
+                                    ) : (
+                                        <Image
+                                            src={info.previewUrl}
+                                            alt={config.label}
+                                            width={240}
+                                            height={160}
+                                            style={{
+                                                maxWidth: 240,
+                                                height: "auto",
+                                                maxHeight: 160,
+                                                borderRadius: 4,
+                                                border: "1px solid #f0f0f0",
+                                                objectFit: "contain",
+                                            }}
+                                        />
+                                    )}
+                                </Space>
+                            ) : null}
+                        </Space>
+                    ) : (
+                        <Typography.Text type="secondary">尚未上传</Typography.Text>
+                    )}
+                    <Form.Item
+                        name={config.key}
+                        rules={[{ required: true, message: `请上传${config.label}` }]}
+                        style={{ marginBottom: 0 }}
+                    >
+                        <Input type="hidden" />
+                    </Form.Item>
+                </Space>
+            </Form.Item>
+        );
+    };
+
     const goNextFromChoose = () => {
         applyDefaultsForKind(userKind);
+        resetDocumentStates();
         setCustomerStep(1);
     };
 
@@ -394,19 +579,21 @@ export default function AccountsPage() {
                 payload.company_representative_name = v.repName;
                 payload.company_representative_document_type = v.repDocType;
                 payload.company_representative_number = v.repDocNo;
-
-                const docValue = v.registrationNumber;
-                if (docValue) {
-                    payload.company_document_id = docValue;
-                    payload.id_front_side_document_id = docValue;
-                    payload.id_back_side_document_id = docValue;
-                }
+                payload.company_document_id = v.company_document_id;
+                payload.id_front_side_document_id = v.id_front_side_document_id;
+                payload.id_back_side_document_id = v.id_back_side_document_id;
             } else {
                 payload.first_name = v.firstName;
                 payload.last_name = v.lastName;
                 payload.id_document_type = v.idDocumentType;
                 payload.id_document_number = v.idDocumentNumber;
+                payload.id_front_side_document_id = v.id_front_side_document_id;
+                payload.id_back_side_document_id = v.id_back_side_document_id;
             }
+
+            if (!payload.company_document_id) delete payload.company_document_id;
+            if (!payload.id_front_side_document_id) delete payload.id_front_side_document_id;
+            if (!payload.id_back_side_document_id) delete payload.id_back_side_document_id;
 
             return createCustomer(payload);
         },
@@ -461,7 +648,9 @@ export default function AccountsPage() {
         mutationFn: async (raw: AccountFormValues) => {
             if (!accountModalCustomer) throw new Error("请选择客户");
             const isCompany = (accountModalCustomer.customerType ?? "").toUpperCase() === "COMPANY";
-            const birthDate = typeof raw.birthDate === "string" ? raw.birthDate : raw.birthDate?.format("YYYY-MM-DD");
+            const baseBirthDate =
+                typeof raw.birthDate === "string" ? raw.birthDate : raw.birthDate?.format("YYYY-MM-DD");
+            const birthDate = baseBirthDate ? `${baseBirthDate} 00:00:00` : undefined;
             const accountCountry = accountModalCustomer.countryCode ?? raw.accountCountryCode;
             const payload: CreateAccountPayload = {
                 customer_map_id: accountModalCustomer.id,
@@ -505,6 +694,7 @@ export default function AccountsPage() {
     });
 
     const [withdrawModalAccount, setWithdrawModalAccount] = useState<AccountItem | null>(null);
+    const [usdPreview, setUsdPreview] = useState<string>("");
     const [withdrawForm] = Form.useForm<WithdrawalFormValues>();
 
     const accountMapById = useMemo(() => {
@@ -531,11 +721,13 @@ export default function AccountsPage() {
             tronAddress: undefined,
             amount: "0",
         });
+        setUsdPreview("");
     };
 
     const closeWithdrawModal = () => {
         setWithdrawModalAccount(null);
         withdrawForm.resetFields();
+        setUsdPreview("");
     };
 
     const withdrawM = useMutation({
@@ -544,6 +736,9 @@ export default function AccountsPage() {
             if (!accountId) throw new Error("未选择账户");
             const account = accountMapById[accountId];
             if (!account) throw new Error("未选择账户");
+            if (!hasExchangeMeta || exchangeRateMinor === null || agentFeeMinor === null) {
+                throw new Error("暂无汇率或手续费信息，暂时无法提现");
+            }
             const amountInput = typeof values.amount === "number" ? values.amount.toString() : (values.amount ?? "").trim();
             if (!amountInput) throw new Error("请输入金额");
             const amountMinor = decimalToMinor(amountInput);
@@ -551,6 +746,8 @@ export default function AccountsPage() {
                 accountMapId: account.id,
                 tronAddress: values.tronAddress,
                 amountMinor,
+                exchangeRateMinor,
+                agentFeeMinor,
             });
         },
         onSuccess: async () => {
@@ -637,7 +834,6 @@ export default function AccountsPage() {
                 const accountActions = record.accounts.length
                     ? record.accounts.map((acc) => (
                           <Space key={acc.id} wrap>
-                              {/* <Typography.Text type="secondary">{pickDisplayName(acc)}</Typography.Text> */}
                               <Button
                                   size="small"
                                   onClick={() => {
@@ -688,17 +884,37 @@ export default function AccountsPage() {
                     );
                 }
                 if (isApprovedStatus(cStatus)) {
+                    const latestStatus = record.latestAccount?.status;
+                    const hasAccounts = record.accounts.length > 0;
+                    const canResubmit =
+                        hasAccounts && !record.hasActiveAccount && isRejectedStatus(latestStatus);
+                    const showCreate = !hasAccounts;
+                    const isAccountPending =
+                        hasAccounts && !record.hasActiveAccount && !isRejectedStatus(latestStatus);
                     return (
                         <Space direction="vertical" size={8} style={{ width: "100%" }}>
-                            {!record.hasActiveAccount ? (
+                            {showCreate ? (
                                 <Button
                                     size="small"
                                     type="primary"
                                     disabled={createAccountM.isPending}
                                     onClick={() => openAccountModal(record.customer, record.latestAccount)}
                                 >
-                                    {record.accounts.length ? "重新提交账户" : "创建账户"}
+                                    创建账户
                                 </Button>
+                            ) : null}
+                            {canResubmit ? (
+                                <Button
+                                    size="small"
+                                    type="primary"
+                                    disabled={createAccountM.isPending}
+                                    onClick={() => openAccountModal(record.customer, record.latestAccount)}
+                                >
+                                    重新提交账户
+                                </Button>
+                            ) : null}
+                            {isAccountPending ? (
+                                <Typography.Text type="secondary">账户审核中</Typography.Text>
                             ) : null}
                             {accountActions}
                         </Space>
@@ -766,13 +982,20 @@ export default function AccountsPage() {
             dataIndex: "status",
             key: "status",
             width: 120,
-            render: (v) => <Tag>{String(v)}</Tag>,
+            render: (v) => renderWithdrawalStatusTag(v),
         },
         {
             title: "订单号",
             key: "orderNo",
             width: 260,
             render: (_, r) => <Typography.Text copyable>{r.id}</Typography.Text>,
+        },
+        {
+            title: "交易哈希",
+            key: "txHash",
+            width: 260,
+            render: (_, r) =>
+                r.transactionHash ? <Typography.Text copyable>{r.transactionHash}</Typography.Text> : <Typography.Text type="secondary">-</Typography.Text>,
         },
         {
             title: "金额",
@@ -792,6 +1015,9 @@ export default function AccountsPage() {
     const renderCustomerActivity = (record: CustomerRow) => {
         if (!record.accounts.length) {
             return <Typography.Text type="secondary">暂无账户，无法展示交易记录</Typography.Text>;
+        }
+        if (!record.accounts.some((acc) => isActiveAccountStatus(acc.status))) {
+            return <Typography.Text type="secondary">暂无激活账户，无法展示交易记录</Typography.Text>;
         }
 
         const labelBySunpayId = new Map<string, string>();
@@ -921,7 +1147,7 @@ export default function AccountsPage() {
                                 客户与账户管理
                             </Typography.Title>
                             <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-                                先创建/审核客户，再为已审核客户创建账户。被拒绝的记录如有新提交自动隐藏。
+                                先创建客户进行KYC认证，已审核通过的客户可以创建银行账户。
                             </Typography.Paragraph>
                         </div>
 
@@ -936,7 +1162,7 @@ export default function AccountsPage() {
                         客户列表
                     </Typography.Title>
                     <Typography.Paragraph type="secondary" style={{ marginTop: 4 }}>
-                        审核中客户不可操作；被拒绝可重新提交；已审核客户无激活账户时可创建或重新提交账户。展开行可查看该客户下所有账户及交易详情。
+                        审核中客户不可操作，被拒绝后可编辑并重新提交。展开行可查看该客户下所有账户及交易详情。
                     </Typography.Paragraph>
                     <Table
                         rowKey="key"
@@ -947,7 +1173,7 @@ export default function AccountsPage() {
                         scroll={{ x: 1200 }}
                         expandable={{
                             expandedRowRender: renderCustomerActivity,
-                            rowExpandable: (record) => record.accounts.length > 0,
+                            rowExpandable: (record) => record.accounts.some((acc) => isActiveAccountStatus(acc.status)),
                             columnWidth: 48,
                         }}
                     />
@@ -1029,13 +1255,29 @@ export default function AccountsPage() {
                             <>
                                 <Typography.Title level={5}>企业信息</Typography.Title>
                                 <Space wrap size={16} style={{ width: "100%" }}>
-                                    <Form.Item label="公司名" name="companyName" rules={[{ required: true }]} style={{ minWidth: 260 }}>
+                                    <Form.Item
+                                        label="公司名"
+                                        name="companyName"
+                                        rules={[
+                                            { required: true },
+                                            { validator: buildMultiWordValidator("公司名") },
+                                        ]}
+                                        style={{ minWidth: 260 }}
+                                    >
                                         <Input />
                                     </Form.Item>
                                     <Form.Item label="注册号" name="registrationNumber" rules={[{ required: true }]} style={{ minWidth: 260 }}>
                                         <Input />
                                     </Form.Item>
-                                    <Form.Item label="法人/代表姓名" name="repName" rules={[{ required: true }]} style={{ minWidth: 260 }}>
+                                    <Form.Item
+                                        label="法人/代表姓名"
+                                        name="repName"
+                                        rules={[
+                                            { required: true },
+                                            { validator: buildMultiWordValidator("法人/代表姓名") },
+                                        ]}
+                                        style={{ minWidth: 260 }}
+                                    >
                                         <Input />
                                     </Form.Item>
                                     <Form.Item label="代表证件类型" name="repDocType" rules={[{ required: true }]} style={{ minWidth: 220 }}>
@@ -1081,6 +1323,13 @@ export default function AccountsPage() {
                                 </Space>
                             </>
                         )}
+
+                        <Typography.Title level={5}>证件上传</Typography.Title>
+                        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+                            {(userKind === "COMPANY" ? COMPANY_DOCUMENT_FIELDS : ID_DOCUMENT_FIELDS).map((field) =>
+                                renderDocumentUploadField(field),
+                            )}
+                        </Space>
                     </Form>
                 ) : null}
 
@@ -1222,7 +1471,7 @@ export default function AccountsPage() {
                         key="submit"
                         type="primary"
                         loading={withdrawM.isPending}
-                        disabled={!hasWithdrawalAddresses}
+                        disabled={disableWithdrawalActions}
                         onClick={() => withdrawForm.submit()}
                     >
                         提交
@@ -1240,7 +1489,18 @@ export default function AccountsPage() {
                                     withdrawModalAccount.balanceCurrency ?? withdrawModalAccount.currency ?? "UNKNOWN",
                                 )}
                             </Descriptions.Item>
+                            <Descriptions.Item label="当前汇率">
+                                {exchangeRateDisplay ? `1 EUR = ${exchangeRateDisplay} USD` : <Typography.Text type="secondary">暂无汇率数据</Typography.Text>}
+                            </Descriptions.Item>
+                            <Descriptions.Item label="手续费率">
+                                {agentFeeDisplay ?? <Typography.Text type="secondary">暂无手续费数据</Typography.Text>}
+                            </Descriptions.Item>
                         </Descriptions>
+                        {!hasExchangeMeta ? (
+                            <Typography.Text type="secondary" style={{ color: "#d46b08" }}>
+                                暂无最新汇率或手续费，暂时无法提交，请稍后重试。
+                            </Typography.Text>
+                        ) : null}
                         {!hasWithdrawalAddresses ? (
                             <Typography.Text type="secondary">
                                 暂无可用的提现地址，请联系管理员在白名单中配置。
@@ -1251,6 +1511,29 @@ export default function AccountsPage() {
                             layout="vertical"
                             onFinish={(values) => withdrawM.mutate(values)}
                             initialValues={{ accountMapId: withdrawModalAccount.id, amount: "0" }}
+                            onValuesChange={(changedValues: Partial<WithdrawalFormValues>) => {
+                                if (Object.prototype.hasOwnProperty.call(changedValues, "accountMapId")) {
+                                    withdrawForm.validateFields(["amount"]).catch(() => {});
+                                }
+                                if (Object.prototype.hasOwnProperty.call(changedValues, "amount")) {
+                                    const raw =
+                                        typeof changedValues.amount === "number"
+                                            ? changedValues.amount.toString()
+                                            : (changedValues.amount ?? "").trim();
+                                    if (raw && hasExchangeMeta && exchangeRateMinor !== null && agentFeeMinor !== null) {
+                                        try {
+                                            const minorStr = decimalToMinor(raw);
+                                            const preview = computeUsdPreviewFromMinor(minorStr, exchangeRateMinor, agentFeeMinor);
+                                            setUsdPreview(preview);
+                                        } catch {
+                                            setUsdPreview("");
+                                        }
+                                    } else {
+                                        setUsdPreview("");
+                                    }
+                                    withdrawForm.validateFields(["amount"]).catch(() => {});
+                                }
+                            }}
                         >
                             <Form.Item
                                 label="提现账户"
@@ -1296,7 +1579,7 @@ export default function AccountsPage() {
                                         (option?.label as string)?.toLowerCase().includes(input.toLowerCase())
                                     }
                                     optionFilterProp="label"
-                                    disabled={!hasWithdrawalAddresses}
+                                    disabled={disableWithdrawalActions}
                                     loading={whitelistQ.isLoading}
                                 />
                             </Form.Item>
@@ -1337,11 +1620,16 @@ export default function AccountsPage() {
                             >
                                 <Input
                                     placeholder="请输入金额，最多两位小数"
-                                    disabled={!hasWithdrawalAddresses}
+                                    disabled={disableWithdrawalActions}
                                     style={{ width: "100%" }}
                                     inputMode="decimal"
                                 />
                             </Form.Item>
+                            {usdPreview ? (
+                                <Typography.Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+                                    预计到账：{usdPreview} USD（按当前汇率与手续费计算，仅供参考）
+                                </Typography.Text>
+                            ) : null}
                         </Form>
                     </Space>
                 ) : null}
@@ -1354,3 +1642,15 @@ type WithdrawalFormValues = {
     tronAddress: string;
     amount?: string | number;
 };
+
+async function fileToBase64(file: File): Promise<string> {
+    const buffer = await file.arrayBuffer();
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+}
